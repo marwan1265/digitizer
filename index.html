@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title></title>
+    <meta name="description" content="Three.js avatar driven by MediaPipe FaceMesh. Mobile-friendly and GitHub Pages-ready." />
+    <link rel="preconnect" href="https://unpkg.com" />
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+    <link rel="stylesheet" href="styles.css" />
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <!-- Three.js canvas area (full-bleed) -->
+    <div id="three-container" class="three-container" aria-label="3D Avatar" role="img"></div>
+
+    <!-- Hidden video for MediaPipe input -->
+    <video id="inputVideo" playsinline muted class="hidden"></video>
+
+    <!-- Status text -->
+    <div id="overlay" class="overlay">
+      <div id="status">Idle — click Start Camera</div>
+    </div>
+
+    <!-- Bottom-centered start button -->
+    <button id="startBtn" class="start-btn">Start Camera</button>
+
+    <!-- MediaPipe FaceMesh (global UMD) -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+
+    <!-- Import map so addons can resolve 'three' bare specifier -->
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+        }
+      }
+    </script>
+
+    <!-- Three.js (ESM) -->
+    <script type="module" src="main.js"></script>
+  </body>
+  </html>
