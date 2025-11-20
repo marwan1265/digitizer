@@ -30,8 +30,8 @@ Customization
 - To drive blendshapes (lip sync, expressions), consider upgrading to MediaPipe Tasks FaceLandmarker with blendshape outputs and map names to your GLB morph targets.
 
 Files
-- `index.html` — App shell, UI, and script includes.
-- `styles.css` — Mobile-friendly layout and controls.
-- `main.js` — Three.js scene, avatar loading, MediaPipe integration, and head pose mapping.
-- `avatar.glb` — Your 3D character.
+- `index.html` - App shell, UI, and script includes.
+- `styles.css` - Mobile-friendly layout and controls.
+- `main.js` - Three.js scene, avatar loading, MediaPipe integration, and head pose mapping.
+- `avatar.glb` - Your 3D character.
 

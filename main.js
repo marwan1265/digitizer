@@ -1,9 +1,10 @@
-// main.js — Avatar + FaceMesh
+// main.js - Avatar + FaceMesh
 
 // Import Three.js modules via ESM CDN
 import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
 import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+import { FilesetResolver, PoseLandmarker } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.mjs';
 
 const ui = {
   container: document.getElementById('three-container'),
@@ -20,6 +21,11 @@ let size = { w: 0, h: 0 };
 let refitFrames = 0; // not used now; keeping for future
 const TARGET_HEIGHT = 1.6;
 const FRAME_PAD = 1.6; // how much extra space around height
+const rig = {}; // resolved skeleton parts for retargeting
+// Simple bind caches for aiming bones along their original child direction
+const bindRotations = new Map(); // bone.uuid -> initial local quaternion
+const restDirs = new Map();      // bone.uuid -> rest direction in parent space (normalized)
+const restPerp = new Map();      // bone.uuid -> a perpendicular axis in parent space (from bind)
 
 // Basic Three.js bootstrap
 function initThree() {
@@ -185,6 +191,8 @@ function animate() {
 let mpInitialized = false;
 let mpCamera = null;
 let faceMesh = null; // created by MP UMD build
+let poseLandmarker = null; // MediaPipe Tasks Pose Landmarker
+let lastPoseVideoTime = -1;
 
 function setStatus(msg) {
   ui.status.textContent = msg;
@@ -208,6 +216,30 @@ function createFaceMesh() {
   });
 }
 
+async function createPoseLandmarker() {
+  // Load WASM and create a PoseLandmarker instance in VIDEO mode
+  const wasmBase = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm';
+  const vision = await FilesetResolver.forVisionTasks(wasmBase);
+  const primaryModel = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+  const fallbackModel = 'https://storage.googleapis.com/mediapipe-assets/pose_landmarker_lite.task';
+  try {
+    poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: primaryModel, delegate: 'GPU' },
+      runningMode: 'VIDEO',
+      numPoses: 1,
+      outputSegmentationMasks: false,
+    });
+  } catch (e) {
+    // Fallback URL (older bucket) if primary fails
+    poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: fallbackModel, delegate: 'GPU' },
+      runningMode: 'VIDEO',
+      numPoses: 1,
+      outputSegmentationMasks: false,
+    });
+  }
+}
+
 
 function startCamera() {
   return new Promise((resolve, reject) => {
@@ -218,7 +250,14 @@ function startCamera() {
         if (faceMesh) {
           await faceMesh.send({ image: video });
         }
-        // FaceMesh only
+        if (poseLandmarker) {
+          const ts = performance.now();
+          if (video.currentTime !== lastPoseVideoTime) {
+            const res = poseLandmarker.detectForVideo(video, ts);
+            onPoseResultsTasks(res);
+            lastPoseVideoTime = video.currentTime;
+          }
+        }
       },
       width: 480,
       height: 640,
@@ -259,17 +298,18 @@ function estimateHeadEuler(landmarks) {
   // Pitch: nose vertical offset vs eyes midpoint
   let pitch = Math.atan2((pN.y - midY), eyeDist);
 
-  // Assume selfie view: flip yaw and roll to feel natural
-  yaw = -yaw;
-  roll = -roll;
+  // Mirroring:
+  // If user looks Left (screen left), yaw is negative.
+  // We want avatar to look Screen Left (its Right, -Y rotation).
+  // So we keep yaw negative.
+  // yaw = -yaw; // REMOVED: This was inverting the mirror.
+  roll = -roll; // Keep roll flip as it was correct.
 
-  // Convert to approximate head Euler in radians
-  // Apply dampening; tuned empirically for stability
-  const S = 1.0;
+  const S = 1.5;
   return {
-    x: THREE.MathUtils.clamp(pitch * 2.0 * S, -0.8, 0.8),  // pitch -> X (flip sign)
-    y: THREE.MathUtils.clamp(yaw * 2.4 * S, -1.0, 1.0),    // yaw   -> Y
-    z: THREE.MathUtils.clamp(-roll * 1.2 * S, -0.7, 0.7),  // roll  -> Z
+    x: THREE.MathUtils.clamp(pitch * 2.0 * S, -0.8, 0.8),
+    y: THREE.MathUtils.clamp(yaw * 2.0 * S, -1.2, 1.2),
+    z: THREE.MathUtils.clamp(roll * 1.0 * S, -0.7, 0.7),
   };
 }
 
@@ -279,16 +319,20 @@ function onFaceResults(results) {
   const euler = estimateHeadEuler(landmarks);
 
   if (headBone && headBone.isBone) {
-    headBone.rotation.set(euler.x, euler.y, euler.z, 'YXZ');
-  } else if (avatar) {
-    avatar.rotation.set(euler.x, euler.y, euler.z, 'YXZ');
+    // Apply rotation with some smoothing
+    const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(euler.x, euler.y, euler.z, 'YXZ'));
+    headBone.quaternion.slerp(q, 0.3);
   }
+  // Removed fallback: rotating the whole avatar is confusing.
 }
 
 ui.startBtn.addEventListener('click', async () => {
   ui.startBtn.disabled = true;
+
   try {
     if (!mpInitialized) await createFaceMesh();
+    // Body tracking disabled
+    // if (!poseLandmarker) await createPoseLandmarker();
     await startCamera();
   } catch (err) {
     console.error(err);
@@ -297,17 +341,119 @@ ui.startBtn.addEventListener('click', async () => {
   }
 });
 
+// Close instructions
+document.getElementById('closeInst').addEventListener('click', () => {
+  document.getElementById('instructions').style.display = 'none';
+});
+
 // Boot
 (async function boot() {
   initThree();
   try {
     await loadAvatar();
-    setStatus('Avatar loaded. Click Start Camera');
+    if (headBone) {
+      setStatus('Avatar loaded (Head found). Click Start Camera');
+    } else {
+      setStatus('Avatar loaded (NO HEAD BONE). Check console.');
+    }
+    // resolveRigBonesOnce(); // Not needed for head only
   } catch (e) {
     console.error('Failed to load avatar.glb', e);
     setStatus('Failed to load avatar.glb');
   }
   animate();
 })();
+
+// Body tracking removed
+function onPoseResultsTasks(results) {
+  // Disabled
+}
+
+// Resolve common torso bones once
+function resolveRigBonesOnce() {
+  if (!avatar) return;
+  if (rig._resolved) return;
+  const find = (pred) => {
+    let out = null;
+    avatar.traverse((o) => {
+      if (out || !o.isBone) return;
+      const n = (o.name || '').toLowerCase();
+      if (pred(n)) out = o;
+    });
+    return out;
+  };
+  rig.spine = find((s) => s.includes('spine1') || (s.includes('spine') && !s.includes('spine2')));
+  rig.chest = find((s) => s.includes('chest') || s.includes('spine2'));
+  rig.neck = find((s) => s.includes('neck'));
+  // Arms
+  const L = (n) => (s) => s.includes(n) && (s.includes('left') || s.endsWith('.l') || s.includes(' l') || s.includes('_l'));
+  const R = (n) => (s) => s.includes(n) && (s.includes('right') || s.endsWith('.r') || s.includes(' r') || s.includes('_r'));
+  rig.upperArmL = find(L('upperarm')) || find(L('arm')) || find(L('shoulder'));
+  rig.lowerArmL = find(L('lowerarm')) || find(L('forearm'));
+  rig.upperArmR = find(R('upperarm')) || find(R('arm')) || find(R('shoulder'));
+  rig.lowerArmR = find(R('lowerarm')) || find(R('forearm'));
+
+  // Cache bind orientation and rest direction for the arm bones
+  const cacheRest = (bone) => {
+    if (!bone || !bone.parent) return;
+    if (!bindRotations.has(bone.uuid)) bindRotations.set(bone.uuid, bone.quaternion.clone());
+    if (!restDirs.has(bone.uuid)) {
+      let childBone = null;
+      for (const c of bone.children) { if (c.isBone) { childBone = c; break; } }
+      if (childBone) {
+        const parent = bone.parent;
+        const A = parent.worldToLocal(bone.getWorldPosition(new THREE.Vector3()));
+        const B = parent.worldToLocal(childBone.getWorldPosition(new THREE.Vector3()));
+        const dir = B.sub(A).normalize();
+        if (dir.lengthSq() > 1e-6) restDirs.set(bone.uuid, dir);
+        // derive a perpendicular axis from the bind orientation (parent space)
+        const xBind = new THREE.Vector3(1, 0, 0).applyQuaternion(bone.quaternion); // local X in parent space
+        const perp = xBind.clone().sub(dir.clone().multiplyScalar(xBind.dot(dir))).normalize();
+        if (perp.lengthSq() > 1e-6) restPerp.set(bone.uuid, perp);
+      }
+    }
+  };
+  cacheRest(rig.upperArmL); cacheRest(rig.lowerArmL);
+  cacheRest(rig.upperArmR); cacheRest(rig.lowerArmR);
+  rig._resolved = true;
+}
+
+// Two-bone arm aim: parent space vectors from shoulder->elbow and elbow->wrist
+function aimTwoBoneArm(upper, lower, shoulderW, elbowW, wristW, poleWorld) {
+  if (!upper || !lower || !upper.parent || !lower.parent) return;
+  const parent = upper.parent;
+  const S = parent.worldToLocal(shoulderW.clone());
+  const E = parent.worldToLocal(elbowW.clone());
+  const W = parent.worldToLocal(wristW.clone());
+  const dirUpper = E.clone().sub(S).normalize();
+  const dirLower = W.clone().sub(E).normalize();
+
+  const restU = restDirs.get(upper.uuid) || new THREE.Vector3(0, 1, 0);
+  const restL = restDirs.get(lower.uuid) || new THREE.Vector3(0, 1, 0);
+  // Base swing (rest -> direction)
+  const qBaseU = new THREE.Quaternion().setFromUnitVectors(restU, dirUpper);
+  // Twist around dir to align with pole
+  let poleLocal = poleWorld ? poleWorld.clone().applyQuaternion(parent.getWorldQuaternion(new THREE.Quaternion()).invert()).normalize() : null;
+  const restT = restPerp.get(upper.uuid) || new THREE.Vector3(1, 0, 0);
+  const tNow = restT.clone().applyQuaternion(qBaseU);
+  const proj = (v) => v.clone().sub(dirUpper.clone().multiplyScalar(v.dot(dirUpper))).normalize();
+  const a = proj(tNow);
+  const b = poleLocal ? proj(poleLocal) : a;
+  let angle = Math.atan2(dirUpper.clone().dot(a.clone().cross(b)), a.dot(b));
+  const MAX_TWIST = Math.PI * 0.8; // clamp
+  angle = THREE.MathUtils.clamp(angle, -MAX_TWIST, MAX_TWIST);
+  const qTwistU = new THREE.Quaternion().setFromAxisAngle(dirUpper, angle);
+  const qU = qTwistU.multiply(qBaseU);
+
+  const qL = new THREE.Quaternion().setFromUnitVectors(restL, dirLower);
+  const bindU = bindRotations.get(upper.uuid) || new THREE.Quaternion();
+  const bindL = bindRotations.get(lower.uuid) || new THREE.Quaternion();
+
+  // Apply with smoothing and small limits to avoid extremes
+  const qTargetU = qU.multiply(bindU);
+  const qTargetL = qL.multiply(bindL);
+  upper.quaternion.slerp(qTargetU, 0.35);
+  lower.quaternion.slerp(qTargetL, 0.4);
+}
 
 // Pose/retargeting removed to return to head-only tracking
