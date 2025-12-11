@@ -92,6 +92,9 @@ async function loadAvatar() {
         scene.add(avatar);
         headBone = findHeadBone(avatar) || null;
         hipsBone = findHipsBone(avatar) || null;
+        findEyeBones(avatar);
+        findFaceMeshWithMorphs(avatar);
+
         frameCameraToAvatar(camera, controls, avatar, TARGET_HEIGHT, FRAME_PAD);
         resolve();
       },
@@ -102,17 +105,20 @@ async function loadAvatar() {
 }
 
 function findHeadBone(root) {
-  let found = null;
+  let headBoneFound = null;
+  let neckBoneFound = null;
   root.traverse((obj) => {
-    if (found) return;
     if (obj.isBone || obj.type === 'Bone') {
       const name = (obj.name || '').toLowerCase();
-      if (name.includes('head') || name.includes('skull') || name.includes('neck')) {
-        found = obj;
+      if (!headBoneFound && (name.includes('head') || name.includes('skull'))) {
+        headBoneFound = obj;
+      }
+      if (!neckBoneFound && name.includes('neck')) {
+        neckBoneFound = obj;
       }
     }
   });
-  return found;
+  return headBoneFound || neckBoneFound; // Prefer head, fallback to neck
 }
 
 function findHipsBone(root) {
@@ -156,22 +162,92 @@ function centerAndPlaceAvatar(object, targetHeight = 1.6) {
   }
 }
 
-// recenterAvatarXZ removed to keep avatar fixed
+// ---- Eye Animation Globals ----
+let leftEyeBone = null;
+let rightEyeBone = null;
+let faceMeshMesh = null; // The mesh that has blendshapes
+let eyeBlinkIndices = []; // Indices for blink morphs
+
+// Saccade State
+const eyeTarget = new THREE.Vector2(0, 0); // yaw, pitch
+const eyeCurrent = new THREE.Vector2(0, 0);
+let nextSaccadeTime = 0;
+
+// Blink State
+let nextBlinkTime = 0;
+let isBlinking = false;
+let blinkStartTime = 0;
+const BLINK_DURATION = 0.15; // seconds
+
+function findEyeBones(root) {
+  root.traverse((obj) => {
+    if (obj.isBone || obj.type === 'Bone') {
+      const n = (obj.name || '').toLowerCase();
+      if (n.includes('lefteye') || n === 'eye.l' || n === 'def_c_eye_l') leftEyeBone = obj;
+      if (n.includes('righteye') || n === 'eye.r' || n === 'def_c_eye_r') rightEyeBone = obj;
+    }
+  });
+}
+
+function findFaceMeshWithMorphs(root) {
+  root.traverse((obj) => {
+    if (obj.isMesh && obj.morphTargetDictionary) {
+      const keys = Object.keys(obj.morphTargetDictionary);
+      console.log('Mesh with morphs:', obj.name, keys); // DEBUG LOG
+
+      if (faceMeshMesh) return; // Already found one? Keep searching or just pick first?
+
+      // Look for blink-related keys
+      const blinkKeys = keys.filter(k => {
+        const kn = k.toLowerCase();
+        return kn.includes('blink') || kn.includes('eyesclosed') || kn.includes('eyeclose') || kn.includes('closure');
+      });
+      if (blinkKeys.length > 0) {
+        faceMeshMesh = obj;
+        eyeBlinkIndices = blinkKeys.map(k => obj.morphTargetDictionary[k]);
+        console.log('SELECTED Face Mesh for blinking:', obj.name, blinkKeys);
+      }
+    }
+  });
+}
+
+const HEAD_FRAME_HEIGHT = 0.5; // Estimated height of head+neck area to frame
+const HEAD_FRAME_PAD = 1.3;
 
 function frameCameraToAvatar(cam, ctrl, object, personHeight = TARGET_HEIGHT, pad = FRAME_PAD) {
   object.updateWorldMatrix(true, true);
-  const box = new THREE.Box3().setFromObject(object);
-  const c = box.getCenter(new THREE.Vector3());
-  const center = new THREE.Vector3(c.x, personHeight * 0.55, c.z);
+
+  let center;
+  let heightToFrame;
+  let padding;
+
+  if (headBone && headBone.isBone) {
+    // Frame the head with some offset for headroom
+    const headPos = headBone.getWorldPosition(new THREE.Vector3());
+    center = headPos.clone().add(new THREE.Vector3(0, 0.08, 0)); // Move target up ~8cm to leave space above head
+    heightToFrame = HEAD_FRAME_HEIGHT;
+    padding = HEAD_FRAME_PAD;
+  } else {
+    // Fallback to full body if no head found
+    const box = new THREE.Box3().setFromObject(object);
+    const c = box.getCenter(new THREE.Vector3());
+    // Aim a bit up from center for full body
+    center = new THREE.Vector3(c.x, personHeight * 0.55, c.z);
+    heightToFrame = personHeight;
+    padding = pad;
+  }
 
   const vFov = THREE.MathUtils.degToRad(cam.fov);
-  const wantHalf = (personHeight * 0.5) * pad;
+  const wantHalf = (heightToFrame * 0.5) * padding;
   const dist = wantHalf / Math.max(1e-4, Math.tan(vFov / 2));
 
-  const dir = new THREE.Vector3(0, 0.15, 1).normalize();
+  // Slightly offset camera Y to be level with eyes/face
+  const dir = new THREE.Vector3(0, 0, 1).normalize();
+
+  // Update camera
   cam.position.copy(center).addScaledVector(dir, dist);
   cam.near = 0.01;
-  cam.far = Math.max(100, dist + personHeight * 5);
+  cam.far = 100;
   cam.updateProjectionMatrix();
 
   if (ctrl) {
@@ -181,8 +257,83 @@ function frameCameraToAvatar(cam, ctrl, object, personHeight = TARGET_HEIGHT, pa
   cam.lookAt(center);
 }
 
+// Basic Three.js bootstrap
+const clock = new THREE.Clock();
+
 function animate() {
   requestAnimationFrame(animate);
+
+  const time = clock.getElapsedTime();
+
+  // Procedural Breathing
+  if (rig && rig.spine) {
+    // A simple sine wave for breathing: ~0.3Hz (3.3s period)
+    const breath = Math.sin(time * 2.0);
+    // Rotate spine slightly on X axis (pitch)
+    rig.spine.rotation.x = breath * 0.005; // Reduced from 0.03 for subtlety
+
+    // Optional: slight counteract with neck
+    if (rig.neck) rig.neck.rotation.x = -breath * 0.002;
+  }
+
+  // --- Eye Saccades ---
+  if (leftEyeBone && rightEyeBone) {
+    if (time > nextSaccadeTime) {
+      // Pick new target: +/- 5 degrees roughly
+      eyeTarget.x = (Math.random() - 0.5) * 0.15;
+      eyeTarget.y = (Math.random() - 0.5) * 0.1;
+      nextSaccadeTime = time + 0.2 + Math.random() * 2.0; // Wait 0.2 - 2.2s
+    }
+    // Smoothly move current to target
+    eyeCurrent.x += (eyeTarget.x - eyeCurrent.x) * 0.1;
+    eyeCurrent.y += (eyeTarget.y - eyeCurrent.y) * 0.1;
+
+    // Apply (local rotation)
+    // We assume eyes are roughly looking +Z or +Y. We add to their base.
+    // Simplifying: just overwrite rotation since binding is usually 0,0,0,1 or close.
+    // Better: setFromEuler additive.
+    // For simplicity in this constrained task, we'll set rotation directly assuming standard rig (Y-up, Z-fwd).
+    leftEyeBone.rotation.y = eyeCurrent.x;
+    leftEyeBone.rotation.x = eyeCurrent.y;
+    rightEyeBone.rotation.y = eyeCurrent.x; // Parallel
+    rightEyeBone.rotation.x = eyeCurrent.y;
+  }
+
+  // --- Auto Blinking ---
+  if (isBlinking) {
+    const elapsed = time - blinkStartTime;
+    if (elapsed >= BLINK_DURATION) {
+      isBlinking = false;
+      nextBlinkTime = time + 2.0 + Math.random() * 4.0;
+
+      // Reset
+      if (faceMeshMesh && eyeBlinkIndices.length > 0) {
+        eyeBlinkIndices.forEach(idx => faceMeshMesh.morphTargetInfluences[idx] = 0);
+      } else if (leftEyeBone && rightEyeBone) {
+        leftEyeBone.scale.y = 1.0;
+        rightEyeBone.scale.y = 1.0;
+      }
+    } else {
+      // Bell curve 0 -> 1 -> 0
+      const t = elapsed / BLINK_DURATION;
+      const val = Math.sin(t * Math.PI);
+
+      if (faceMeshMesh && eyeBlinkIndices.length > 0) {
+        eyeBlinkIndices.forEach(idx => faceMeshMesh.morphTargetInfluences[idx] = val);
+      } else if (leftEyeBone && rightEyeBone) {
+        // Scale Y from 1.0 down to 0.1 and back
+        const s = 1.0 - (val * 0.99); // min scale 0.01
+        leftEyeBone.scale.y = s;
+        rightEyeBone.scale.y = s;
+      }
+    }
+  } else {
+    if (time > nextBlinkTime) {
+      isBlinking = true;
+      blinkStartTime = time;
+    }
+  }
+
   controls.update();
   renderer.render(scene, camera);
 }
@@ -273,21 +424,28 @@ function startCamera() {
 
 // A lightweight head pose estimation from landmarks
 // Uses eye line for roll, nose offset for yaw/pitch. Not perfect but performant and robust on mobile.
+
+// Calibration state
+let initialPitch = null;
+
 function estimateHeadEuler(landmarks) {
   // landmark indices (MediaPipe canonical mesh)
   const LEFT_EYE_OUTER = 33;
   const RIGHT_EYE_OUTER = 263;
-  const NOSE_TIP = 1; // approximate
+  const NOSE_TIP = 1;
+  const FOREHEAD = 10;  // Top of forehead
+  const CHIN = 152;     // Bottom of chin
 
   const pL = landmarks[LEFT_EYE_OUTER];
   const pR = landmarks[RIGHT_EYE_OUTER];
   const pN = landmarks[NOSE_TIP];
+  const pForehead = landmarks[FOREHEAD];
+  const pChin = landmarks[CHIN];
 
   const vx = pR.x - pL.x;
   const vy = pR.y - pL.y;
   const eyeDist = Math.max(1e-6, Math.hypot(vx, vy));
   const midX = (pL.x + pR.x) * 0.5;
-  const midY = (pL.y + pR.y) * 0.5;
 
   // Roll: tilt of eye line
   let roll = Math.atan2(vy, vx);
@@ -295,21 +453,28 @@ function estimateHeadEuler(landmarks) {
   // Yaw: nose horizontal offset vs eyes midpoint
   let yaw = Math.atan2((pN.x - midX), eyeDist);
 
-  // Pitch: nose vertical offset vs eyes midpoint
-  let pitch = Math.atan2((pN.y - midY), eyeDist);
+  // Pitch: use 3D depth difference between forehead and chin
+  // When tilting forward, chin.z < forehead.z (chin closer to camera)
+  // When tilting backward, chin.z > forehead.z (forehead closer)
+  let rawPitch = (pForehead.z - pChin.z) * 5.0;  // Scale up since z-diffs are small
 
-  // Mirroring:
-  // If user looks Left (screen left), yaw is negative.
-  // We want avatar to look Screen Left (its Right, -Y rotation).
-  // So we keep yaw negative.
-  // yaw = -yaw; // REMOVED: This was inverting the mirror.
-  roll = -roll; // Keep roll flip as it was correct.
+  // Calibration: store initial pitch and subtract it
+  if (initialPitch === null) {
+    initialPitch = rawPitch;
+  }
+  let pitch = rawPitch - initialPitch;
 
-  const S = 1.5;
+  // Assume selfie view: flip yaw and roll to feel natural
+  // yaw = -yaw; // Removed: was inverting left/right
+  roll = -roll;
+
+  // Convert to approximate head Euler in radians
+  // Apply dampening; tuned empirically for stability
+  const S = 1.0;
   return {
-    x: THREE.MathUtils.clamp(pitch * 2.0 * S, -0.8, 0.8),
-    y: THREE.MathUtils.clamp(yaw * 2.0 * S, -1.2, 1.2),
-    z: THREE.MathUtils.clamp(roll * 1.0 * S, -0.7, 0.7),
+    x: THREE.MathUtils.clamp(-pitch * 2.0 * S, -0.8, 0.8),  // pitch -> X (inverted)
+    y: THREE.MathUtils.clamp(yaw * 2.4 * S, -1.0, 1.0),    // yaw   -> Y
+    z: THREE.MathUtils.clamp(-roll * 1.2 * S, -0.7, 0.7),  // roll  -> Z
   };
 }
 
@@ -319,11 +484,13 @@ function onFaceResults(results) {
   const euler = estimateHeadEuler(landmarks);
 
   if (headBone && headBone.isBone) {
-    // Apply rotation with some smoothing
-    const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(euler.x, euler.y, euler.z, 'YXZ'));
-    headBone.quaternion.slerp(q, 0.3);
+    // Smoothing: blend via quaternion slerp to reduce jitter
+    const targetQ = new THREE.Quaternion().setFromEuler(new THREE.Euler(euler.x, euler.y, euler.z, 'YXZ'));
+    headBone.quaternion.slerp(targetQ, 0.15);
+  } else if (avatar) {
+    const targetQ = new THREE.Quaternion().setFromEuler(new THREE.Euler(euler.x, euler.y, euler.z, 'YXZ'));
+    avatar.quaternion.slerp(targetQ, 0.15);
   }
-  // Removed fallback: rotating the whole avatar is confusing.
 }
 
 ui.startBtn.addEventListener('click', async () => {
@@ -356,7 +523,7 @@ document.getElementById('closeInst').addEventListener('click', () => {
     } else {
       setStatus('Avatar loaded (NO HEAD BONE). Check console.');
     }
-    // resolveRigBonesOnce(); // Not needed for head only
+    resolveRigBonesOnce(); // Needed for breathing animation
   } catch (e) {
     console.error('Failed to load avatar.glb', e);
     setStatus('Failed to load avatar.glb');
